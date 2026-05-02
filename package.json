@@ -1,0 +1,27 @@
+{
+  "name": "postcraftstudio",
+  "version": "0.1.0",
+  "description": "CLI for the Postcraftstudio API. Drives article generation, asset retrieval, and discovery from a Claude skill or any shell.",
+  "bin": {
+    "postcraftstudio": "./scripts/postcraftstudio.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "smoke": "node scripts/postcraftstudio.js --version"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/<owner>/postcraftstudio-skill.git"
+  },
+  "homepage": "https://postcraftstudio.com/api/v1/docs",
+  "license": "MIT",
+  "files": [
+    "scripts",
+    "SKILL.md",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ]
+}

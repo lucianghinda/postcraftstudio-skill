@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.runtime }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node-18, node-20, node-22, bun]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        if: startsWith(matrix.runtime, 'node-')
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.runtime == 'node-18' && '18' || matrix.runtime == 'node-20' && '20' || '22' }}
+
+      - name: Set up Bun
+        if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@v2
+
+      - name: --version smoke (Node)
+        if: startsWith(matrix.runtime, 'node-')
+        run: node scripts/postcraftstudio.js --version
+
+      - name: --version smoke (Bun)
+        if: matrix.runtime == 'bun'
+        run: bun scripts/postcraftstudio.js --version
+
+      - name: --help renders
+        run: node scripts/postcraftstudio.js --help
+        if: startsWith(matrix.runtime, 'node-')
