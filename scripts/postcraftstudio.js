@@ -18,7 +18,7 @@ const os = require("os");
 const readline = require("readline");
 const crypto = require("crypto");
 
-const VERSION = "0.1.0";
+const VERSION = "1.0.0";
 const DEFAULT_BASE_URL = "https://postcraftstudio.com";
 const SETTINGS_URL = "https://postcraftstudio.com/settings/api_keys";
 const API_KEY_PATTERN = /^pcs_live_[A-Za-z0-9]{32}$/;
