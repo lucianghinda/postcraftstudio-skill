@@ -27,3 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   30 s timeout, and a 5-redirect cap.
 - Exit codes: 0 success, 1 runtime/network, 2 invalid input, 3 timeout,
   4 article failed.
+- `themes:list` and `writing-styles:list` discovery commands with table or
+  `--json` output.
+- `assets:list <article_id>` shows text and image assets in a single table,
+  with attachment status for images.
+- `assets:download <text|image> <id> [--out path]` streams asset bytes to
+  disk. Filename precedence: `--out` > server `Content-Disposition` >
+  fallback `<type>-<id>.<ext>` with `<ext>` inferred from `Content-Type`.

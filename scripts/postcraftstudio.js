@@ -666,6 +666,161 @@ async function cmdArticlesList(args) {
 }
 
 // ----------------------------------------------------------------------------
+// discovery + asset commands (U17)
+
+async function cmdThemesList(args) {
+  const { data } = await apiCall("GET", "/api/v1/themes");
+  if (flagBool(args, "json")) return writeOut(JSON.stringify(data, null, 2));
+  const rows = (data.themes || []).map((t) => ({ slug: t.slug, name: t.name }));
+  printTable(rows, [
+    { key: "slug", title: "Slug" },
+    { key: "name", title: "Name" },
+  ]);
+}
+
+async function cmdWritingStylesList(args) {
+  const { data } = await apiCall("GET", "/api/v1/writing_styles");
+  if (flagBool(args, "json")) return writeOut(JSON.stringify(data, null, 2));
+  const rows = (data.writing_styles || []).map((s) => ({
+    id: s.id,
+    version: s.version_number,
+    status: statusBadge(s.status || ""),
+    active: s.active ? fmt.green("yes") : fmt.dim("no"),
+    summary: truncate(s.summary || "", 60),
+  }));
+  printTable(rows, [
+    { key: "id", title: "ID" },
+    { key: "version", title: "Ver" },
+    { key: "status", title: "Status" },
+    { key: "active", title: "Active" },
+    { key: "summary", title: "Summary" },
+  ]);
+}
+
+async function cmdAssetsList(args) {
+  const articleId = args._[1];
+  if (!articleId) fail("assets:list requires an article id: postcraftstudio assets:list <article_id>");
+  const { data } = await apiCall("GET", `/api/v1/articles/${articleId}/assets`);
+  if (flagBool(args, "json")) return writeOut(JSON.stringify(data, null, 2));
+
+  const textRows = (data.text_assets || []).map((a) => ({
+    type: "text",
+    id: a.id,
+    asset_type: a.asset_type,
+    status: statusBadge(a.status || ""),
+    attached: "—",
+    updated: a.updated_at ? a.updated_at.slice(0, 19).replace("T", " ") : "",
+  }));
+  const imageRows = (data.image_assets || []).map((a) => ({
+    type: "image",
+    id: a.id,
+    asset_type: a.asset_type,
+    status: statusBadge(a.status || ""),
+    attached: a.attached ? fmt.green("yes") : fmt.dim("no"),
+    updated: a.updated_at ? a.updated_at.slice(0, 19).replace("T", " ") : "",
+  }));
+  const rows = [...textRows, ...imageRows];
+  printTable(rows, [
+    { key: "type", title: "Kind" },
+    { key: "id", title: "ID" },
+    { key: "asset_type", title: "Asset type" },
+    { key: "status", title: "Status" },
+    { key: "attached", title: "Attached" },
+    { key: "updated", title: "Updated" },
+  ]);
+  if (rows.length) {
+    writeErr(fmt.dim(`download: postcraftstudio assets:download <text|image> <id> [--out path]`));
+  }
+}
+
+const CONTENT_TYPE_EXTENSIONS = {
+  "text/markdown": "md",
+  "text/plain": "txt",
+  "text/html": "html",
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/svg+xml": "svg",
+  "application/pdf": "pdf",
+};
+
+function extensionForContentType(contentType) {
+  if (!contentType) return "bin";
+  const base = contentType.split(";")[0].trim().toLowerCase();
+  return CONTENT_TYPE_EXTENSIONS[base] || "bin";
+}
+
+function filenameFromContentDisposition(header) {
+  if (!header) return null;
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+async function streamResponseToFile(response, filePath) {
+  const writeStream = fs.createWriteStream(filePath);
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!writeStream.write(Buffer.from(value))) {
+        await new Promise((resolve) => writeStream.once("drain", resolve));
+      }
+    }
+  } finally {
+    await new Promise((resolve, reject) => {
+      writeStream.end((err) => (err ? reject(err) : resolve()));
+    });
+  }
+}
+
+async function cmdAssetsDownload(args) {
+  const assetType = args._[1];
+  const assetId = args._[2];
+  if (!assetType || !assetId) {
+    fail("assets:download requires an asset type and id: postcraftstudio assets:download <text|image> <id> [--out path]");
+  }
+  if (assetType !== "text" && assetType !== "image") {
+    fail(`asset type must be 'text' or 'image', got '${assetType}'.`);
+  }
+
+  const response = await rawRequest("GET", `/api/v1/assets/${assetType}/${assetId}/content`);
+  if (!response.ok) {
+    const data = await parseJsonSafe(response);
+    const env = data && data.error ? data.error : {};
+    throw new ApiError(env.message || `HTTP ${response.status}`, {
+      status: response.status,
+      type: env.type || null,
+      details: env.details || null,
+      requestId: env.request_id || null,
+      retryAfter: response.headers.get("retry-after"),
+    });
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  const dispositionName = filenameFromContentDisposition(response.headers.get("content-disposition"));
+  const ext = extensionForContentType(contentType);
+
+  const outFlag = flagString(args, "out");
+  const outPath = outFlag || dispositionName || `${assetType}-${assetId}.${ext}`;
+
+  const dir = path.dirname(path.resolve(outPath));
+  if (!fs.existsSync(dir)) fail(`output directory does not exist: ${dir}`);
+
+  await streamResponseToFile(response, outPath);
+
+  if (flagBool(args, "json")) {
+    writeOut(JSON.stringify({ path: outPath, content_type: contentType.split(";")[0].trim() }, null, 2));
+  } else {
+    const size = fs.statSync(outPath).size;
+    writeErr(fmt.green("✔ ") + `wrote ${size} bytes to ${fmt.bold(outPath)} ${fmt.dim("(" + contentType + ")")}`);
+    writeOut(outPath);
+  }
+}
+
+// ----------------------------------------------------------------------------
 // config commands
 
 async function cmdConfigShow() {
@@ -714,10 +869,11 @@ function printHelp() {
     `  articles:status <id>           Print article status + summary`,
     `  articles:get <id>              Print full article JSON`,
     `  articles:list [--cursor <id>]  Cursor-paginated article list`,
-    `  themes:list                    List themes ${fmt.dim("(U17 — pending)")}`,
-    `  writing-styles:list            List writing styles ${fmt.dim("(U17 — pending)")}`,
-    `  assets:list <article_id>       List assets for an article ${fmt.dim("(U17 — pending)")}`,
-    `  assets:download <type> <id>    Download an asset to disk ${fmt.dim("(U17 — pending)")}`,
+    `  themes:list                    List themes`,
+    `  writing-styles:list            List writing styles`,
+    `  assets:list <article_id>       List text and image assets for an article`,
+    `  assets:download <type> <id>    Download an asset to disk (type: text|image)`,
+    `    --out <path>                   Output path (default: server filename or <type>-<id>.<ext>)`,
     ``,
     `${fmt.bold("Global flags:")}`,
     `  --version, -v                  Print version`,
@@ -733,12 +889,6 @@ function printHelp() {
     `${fmt.bold("Docs:")} https://postcraftstudio.com/api/v1/docs`,
   ];
   writeOut(lines.join("\n"));
-}
-
-function notImplementedYet(unit, command) {
-  writeErr(fmt.yellow(`'${command}' is planned for ${unit} and not implemented yet.`));
-  writeErr(fmt.dim(`Track progress in docs/plans/agent-skills-and-api-plan.md.`));
-  process.exit(2);
 }
 
 // ----------------------------------------------------------------------------
@@ -768,10 +918,13 @@ async function main(argv) {
       return cmdArticlesList(args);
 
     case "themes:list":
+      return cmdThemesList(args);
     case "writing-styles:list":
+      return cmdWritingStylesList(args);
     case "assets:list":
+      return cmdAssetsList(args);
     case "assets:download":
-      return notImplementedYet("U17", command);
+      return cmdAssetsDownload(args);
 
     default:
       writeErr(fmt.red(`unknown command: ${command}`));
