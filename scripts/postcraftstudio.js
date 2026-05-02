@@ -4,8 +4,8 @@
  * Postcraftstudio CLI — drives the Postcraftstudio API for article generation,
  * asset retrieval, and discovery from a Claude skill or any shell.
  *
- * Zero runtime dependencies. Built-ins only: fetch, fs, path, os, readline.
- * Runs on Node 18+ and Bun.
+ * Zero runtime dependencies. Built-ins only: fetch, fs, path, os, readline,
+ * crypto, https, url. Runs on Node 18+ and Bun.
  *
  * API docs: https://postcraftstudio.com/api/v1/docs
  */
@@ -16,12 +16,19 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const readline = require("readline");
+const crypto = require("crypto");
 
 const VERSION = "0.1.0";
 const DEFAULT_BASE_URL = "https://postcraftstudio.com";
 const SETTINGS_URL = "https://postcraftstudio.com/settings/api_keys";
 const API_KEY_PATTERN = /^pcs_live_[A-Za-z0-9]{32}$/;
 const TOKEN_PROBE_PATH = "/api/v1/themes";
+const TERMINAL_STATUSES = new Set(["completed", "failed"]);
+const DEFAULT_POLL_INTERVAL_MS = 2000;
+const DEFAULT_TIMEOUT_SECONDS = 300;
+const LOCAL_FETCH_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const LOCAL_FETCH_TIMEOUT_MS = 30_000;
+const LOCAL_FETCH_MAX_REDIRECTS = 5;
 
 const GLOBAL_CONFIG_DIR = path.join(os.homedir(), ".config", "postcraftstudio");
 const GLOBAL_CONFIG_FILE = path.join(GLOBAL_CONFIG_DIR, "config.json");
@@ -114,7 +121,19 @@ function requireApiKey() {
 // ----------------------------------------------------------------------------
 // HTTP
 
-async function apiRequest(method, endpoint, { body = null, apiKey = null, headers = {} } = {}) {
+class ApiError extends Error {
+  constructor(message, { status = null, type = null, details = null, requestId = null, retryAfter = null, network = false } = {}) {
+    super(message);
+    this.status = status;
+    this.type = type;
+    this.details = details;
+    this.requestId = requestId;
+    this.retryAfter = retryAfter;
+    this.network = network;
+  }
+}
+
+async function rawRequest(method, endpoint, { body = null, apiKey = null, headers = {} } = {}) {
   const base = resolveBaseUrl();
   const url = base + endpoint;
   const key = apiKey || requireApiKey();
@@ -130,21 +149,10 @@ async function apiRequest(method, endpoint, { body = null, apiKey = null, header
     init.headers["Content-Type"] = init.headers["Content-Type"] || "application/json";
     init.body = typeof body === "string" ? body : JSON.stringify(body);
   }
-  let response;
   try {
-    response = await fetch(url, init);
+    return await fetch(url, init);
   } catch (err) {
     throw new ApiError(`Network error contacting ${url}: ${err.message}`, { network: true });
-  }
-  return response;
-}
-
-class ApiError extends Error {
-  constructor(message, { status = null, body = null, network = false } = {}) {
-    super(message);
-    this.status = status;
-    this.body = body;
-    this.network = network;
   }
 }
 
@@ -155,6 +163,82 @@ async function parseJsonSafe(response) {
     return JSON.parse(text);
   } catch {
     return { raw: text };
+  }
+}
+
+/**
+ * High-level call: returns parsed JSON on 2xx, throws ApiError on non-2xx
+ * with the server's error envelope unmarshaled.
+ */
+async function apiCall(method, endpoint, opts = {}) {
+  const response = await rawRequest(method, endpoint, opts);
+  const data = await parseJsonSafe(response);
+  if (response.ok) return { data, response };
+  const env = data && data.error ? data.error : {};
+  throw new ApiError(env.message || `HTTP ${response.status}`, {
+    status: response.status,
+    type: env.type || null,
+    details: env.details || null,
+    requestId: env.request_id || null,
+    retryAfter: response.headers.get("retry-after"),
+  });
+}
+
+// ----------------------------------------------------------------------------
+// Local-fetch (for P1-E-3 source_unreachable fallback)
+
+async function localFetch(targetUrl) {
+  let current = targetUrl;
+  let redirectsLeft = LOCAL_FETCH_MAX_REDIRECTS;
+  while (true) {
+    const parsed = new URL(current);
+    if (parsed.protocol !== "https:") {
+      throw new Error(`local fetch refused: only https:// is allowed, got ${parsed.protocol}`);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LOCAL_FETCH_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(current, { redirect: "manual", signal: controller.signal });
+    } catch (err) {
+      clearTimeout(timer);
+      if (err.name === "AbortError") throw new Error(`local fetch timed out after ${LOCAL_FETCH_TIMEOUT_MS}ms`);
+      throw new Error(`local fetch network error: ${err.message}`);
+    }
+    clearTimeout(timer);
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error(`local fetch ${response.status} redirect without Location header`);
+      if (redirectsLeft === 0) throw new Error(`local fetch exceeded ${LOCAL_FETCH_MAX_REDIRECTS} redirects`);
+      redirectsLeft--;
+      current = new URL(location, current).toString();
+      continue;
+    }
+
+    if (!response.ok) throw new Error(`local fetch HTTP ${response.status}`);
+
+    const contentLength = response.headers.get("content-length");
+    if (contentLength && Number(contentLength) > LOCAL_FETCH_MAX_BYTES) {
+      throw new Error(`local fetch refused: Content-Length ${contentLength} exceeds 10 MB limit`);
+    }
+
+    // Stream-read with a hard byte cap so a missing/lying Content-Length can't OOM us.
+    const chunks = [];
+    let total = 0;
+    const reader = response.body.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > LOCAL_FETCH_MAX_BYTES) {
+        try { await reader.cancel(); } catch (_e) { /* noop */ }
+        throw new Error(`local fetch refused: response exceeded 10 MB limit mid-stream`);
+      }
+      chunks.push(value);
+    }
+    const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+    return buf.toString("utf-8");
   }
 }
 
@@ -191,6 +275,69 @@ function parseArgs(argv) {
   return result;
 }
 
+function flagString(args, name) {
+  const v = args.flags[name];
+  return typeof v === "string" ? v : null;
+}
+
+function flagBool(args, name) {
+  return args.flags[name] === true || args.flags[name] === "true";
+}
+
+function flagInt(args, name) {
+  const v = args.flags[name];
+  if (v === undefined || v === true) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+// ----------------------------------------------------------------------------
+// Misc helpers
+
+function uuidv4() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  // RFC4122 v4 fallback (Node <19 should still have randomUUID; this is paranoia).
+  const bytes = crypto.randomBytes(16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function truncate(s, n) {
+  if (!s) return "";
+  return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+function printTable(rows, columns) {
+  if (rows.length === 0) {
+    writeOut(fmt.dim("(no rows)"));
+    return;
+  }
+  const widths = columns.map((col) => {
+    const cells = rows.map((r) => String(r[col.key] ?? ""));
+    return Math.max(col.title.length, ...cells.map((c) => c.length));
+  });
+  const header = columns.map((col, i) => fmt.bold(col.title.padEnd(widths[i]))).join("  ");
+  const separator = columns.map((_, i) => "─".repeat(widths[i])).join("  ");
+  writeOut(header);
+  writeOut(fmt.dim(separator));
+  for (const row of rows) {
+    writeOut(columns.map((col, i) => String(row[col.key] ?? "").padEnd(widths[i])).join("  "));
+  }
+}
+
+function statusBadge(status) {
+  if (status === "completed") return fmt.green(status);
+  if (status === "failed") return fmt.red(status);
+  if (status === "processing" || status === "pending") return fmt.yellow(status);
+  return status;
+}
+
 // ----------------------------------------------------------------------------
 // Readline prompts
 
@@ -198,19 +345,17 @@ function prompt(question, { silent = false } = {}) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
     if (silent) {
-      // Mute echo for paste-the-token UX.
-      const onData = () => {};
-      process.stdin.on("data", onData);
       rl.question(question, (answer) => {
-        process.stdin.off("data", onData);
         rl.close();
         process.stderr.write("\n");
         resolve(answer.trim());
       });
       // eslint-disable-next-line no-underscore-dangle
+      const originalWrite = rl._writeToOutput.bind(rl);
+      // eslint-disable-next-line no-underscore-dangle
       rl._writeToOutput = (str) => {
-        if (str.includes(question)) process.stderr.write(str);
-        else process.stderr.write("");
+        if (str.startsWith(question)) originalWrite(str);
+        // else: silence echo of pasted/typed key
       };
     } else {
       rl.question(question, (answer) => {
@@ -229,7 +374,41 @@ async function confirm(question, defaultYes = false) {
 }
 
 // ----------------------------------------------------------------------------
-// setup command
+// Error rendering
+
+function describeApiError(err) {
+  const lines = [];
+  if (err.status === 401) {
+    lines.push(`Unauthorized (HTTP 401). Run '${fmt.bold("postcraftstudio setup")}' to refresh your API key.`);
+  } else if (err.status === 402) {
+    const remaining = err.details && err.details.remaining;
+    lines.push(`Plan limit reached (HTTP 402). ${err.message}`);
+    if (remaining != null) lines.push(fmt.dim(`Remaining: ${remaining}.`));
+  } else if (err.status === 422) {
+    lines.push(`Validation failed (HTTP 422). ${err.message}`);
+    if (err.details && typeof err.details === "object") {
+      for (const [field, errs] of Object.entries(err.details)) {
+        const list = Array.isArray(errs) ? errs.join(", ") : String(errs);
+        lines.push(`  ${fmt.bold(field)}: ${list}`);
+      }
+    }
+  } else if (err.status === 429) {
+    lines.push(`Rate limited (HTTP 429). ${err.message}`);
+    if (err.retryAfter) lines.push(fmt.dim(`Retry-After: ${err.retryAfter} seconds.`));
+  } else if (err.status === 502 && err.type === "source_unreachable") {
+    const reason = err.details && err.details.reason ? err.details.reason : "unknown";
+    lines.push(`Source URL could not be reached (reason: ${reason}). ${err.message}`);
+  } else if (err.status) {
+    lines.push(`API error ${err.status}${err.type ? " " + fmt.dim("(" + err.type + ")") : ""}: ${err.message}`);
+  } else {
+    lines.push(err.message);
+  }
+  if (err.requestId) lines.push(fmt.dim(`request_id: ${err.requestId}`));
+  return lines.join("\n");
+}
+
+// ----------------------------------------------------------------------------
+// setup command (U15)
 
 async function cmdSetup(args) {
   writeErr(fmt.bold("Postcraftstudio setup"));
@@ -238,15 +417,13 @@ async function cmdSetup(args) {
   writeErr(`Token format: ${fmt.dim("pcs_live_<32 alphanumeric characters>")}`);
   writeErr("");
 
-  const baseFromFlag = args.flags["base-url"];
-  const baseUrl = (typeof baseFromFlag === "string" && baseFromFlag) || (await prompt(`Base URL [${DEFAULT_BASE_URL}]: `)) || DEFAULT_BASE_URL;
+  const baseFromFlag = flagString(args, "base-url");
+  const baseUrl = baseFromFlag || (await prompt(`Base URL [${DEFAULT_BASE_URL}]: `)) || DEFAULT_BASE_URL;
   const normalizedBase = baseUrl.replace(/\/$/, "");
 
-  const keyFromFlag = args.flags["api-key"];
-  let apiKey = typeof keyFromFlag === "string" ? keyFromFlag.trim() : "";
-  if (!apiKey) {
-    apiKey = (await prompt("Paste API key: ", { silent: true })).trim();
-  }
+  const keyFromFlag = flagString(args, "api-key");
+  let apiKey = keyFromFlag ? keyFromFlag.trim() : "";
+  if (!apiKey) apiKey = (await prompt("Paste API key: ", { silent: true })).trim();
 
   if (!API_KEY_PATTERN.test(apiKey)) {
     fail(
@@ -259,30 +436,22 @@ async function cmdSetup(args) {
 
   const previousBase = process.env.POSTCRAFTSTUDIO_BASE_URL;
   process.env.POSTCRAFTSTUDIO_BASE_URL = normalizedBase;
-  let response;
   try {
-    response = await apiRequest("GET", TOKEN_PROBE_PATH, { apiKey });
+    await apiCall("GET", TOKEN_PROBE_PATH, { apiKey });
   } catch (err) {
+    if (err instanceof ApiError && err.status === 401) {
+      fail(`The API rejected this key (HTTP 401). Get a fresh key at ${SETTINGS_URL} and try again.`);
+    }
+    fail(err instanceof ApiError ? describeApiError(err) : err.message);
+  } finally {
     if (previousBase === undefined) delete process.env.POSTCRAFTSTUDIO_BASE_URL;
     else process.env.POSTCRAFTSTUDIO_BASE_URL = previousBase;
-    fail(err.message);
-  }
-  if (previousBase === undefined) delete process.env.POSTCRAFTSTUDIO_BASE_URL;
-  else process.env.POSTCRAFTSTUDIO_BASE_URL = previousBase;
-
-  if (response.status === 401) {
-    fail(`The API rejected this key (HTTP 401). Get a fresh key at ${SETTINGS_URL} and try again.`);
-  }
-  if (!response.ok) {
-    const body = await parseJsonSafe(response);
-    const detail = body && body.error && body.error.message ? body.error.message : `HTTP ${response.status}`;
-    fail(`Probe failed: ${detail}`);
   }
 
-  const useProject = args.flags.project === true || args.flags.project === "true";
-  const useGlobal = args.flags.global === true || args.flags.global === "true";
-  let scope;
+  const useProject = flagBool(args, "project");
+  const useGlobal = flagBool(args, "global");
   if (useProject && useGlobal) fail("Pass either --project or --global, not both.");
+  let scope;
   if (useProject) scope = "project";
   else if (useGlobal) scope = "global";
   else scope = (await confirm("Save to project (./.postcraftstudio/config.json)?", false)) ? "project" : "global";
@@ -296,6 +465,204 @@ async function cmdSetup(args) {
   writeErr("");
   writeErr(fmt.green("✔ ") + `API key saved to ${fmt.dim(file)}`);
   writeErr(fmt.dim(`Run 'postcraftstudio --help' to see available commands.`));
+}
+
+// ----------------------------------------------------------------------------
+// articles commands (U16)
+
+function buildCreatePayload(args) {
+  const payload = {};
+  const body = flagString(args, "body");
+  const file = flagString(args, "file");
+  const sourceUrl = flagString(args, "source-url");
+  const bodyHtml = flagString(args, "body-html");
+
+  const sources = [body, file, sourceUrl, bodyHtml].filter((v) => v != null);
+  if (sources.length === 0) {
+    fail("articles:create requires one of --body, --source-url, --body-html, or --file <path>.");
+  }
+  if (sources.length > 1) {
+    fail("articles:create accepts only one source: pick one of --body, --source-url, --body-html, --file.");
+  }
+
+  if (body) payload.body = body;
+  if (file) {
+    if (!fs.existsSync(file)) fail(`--file not found: ${file}`);
+    payload.body = fs.readFileSync(file, "utf-8");
+  }
+  if (sourceUrl) payload.source_url = sourceUrl;
+  if (bodyHtml) payload.body_html = bodyHtml;
+
+  for (const flag of ["theme-slug", "writing-style-id", "article-purpose", "main-idea", "title", "generate"]) {
+    const v = flagString(args, flag);
+    if (v != null) {
+      const key = flag.replace(/-/g, "_");
+      payload[key] = flag === "writing-style-id" ? Number(v) : v;
+    }
+  }
+  return payload;
+}
+
+function summarizeArticleFromCreate(article) {
+  const { id, status, title, theme_slug: themeSlug, article_purpose: purpose } = article;
+  const lines = [
+    `${fmt.bold("Article")} #${id} ${fmt.dim("[" + statusBadge(status) + "]")}`,
+  ];
+  if (title) lines.push(`  title: ${title}`);
+  if (themeSlug) lines.push(`  theme: ${themeSlug}`);
+  if (purpose) lines.push(`  purpose: ${purpose}`);
+  return lines.join("\n");
+}
+
+async function pollUntilDone(articleId, { intervalMs, timeoutMs, json }) {
+  const started = Date.now();
+  let lastStatus = null;
+  while (true) {
+    const { data, response } = await apiCall("GET", `/api/v1/articles/${articleId}`);
+    if (data.status !== lastStatus && !json) {
+      writeErr(fmt.dim(`status: ${statusBadge(data.status)}`));
+      lastStatus = data.status;
+    }
+    if (TERMINAL_STATUSES.has(data.status)) return data;
+    if (Date.now() - started >= timeoutMs) {
+      const err = new Error(`Timed out after ${(timeoutMs / 1000).toFixed(0)}s while polling. Article ${articleId} is still ${data.status}; run 'postcraftstudio articles:status ${articleId}' to keep checking.`);
+      err.timeout = true;
+      err.lastSnapshot = data;
+      throw err;
+    }
+    const retryHeader = response.headers.get("retry-after");
+    const wait = retryHeader ? Math.max(1000, Number(retryHeader) * 1000) : intervalMs;
+    await sleep(wait);
+  }
+}
+
+async function postArticle(payload, idempotencyKey) {
+  return apiCall("POST", "/api/v1/articles", {
+    body: payload,
+    headers: { "Idempotency-Key": idempotencyKey },
+  });
+}
+
+async function cmdArticlesCreate(args) {
+  let payload = buildCreatePayload(args);
+  const json = flagBool(args, "json");
+  const noWait = flagBool(args, "no-wait");
+  const timeoutSec = flagInt(args, "timeout") ?? DEFAULT_TIMEOUT_SECONDS;
+  const idempotencyKey = flagString(args, "idempotency-key") || uuidv4();
+  const autoLocalFetch = flagBool(args, "auto-local-fetch");
+
+  let created;
+  try {
+    created = await postArticle(payload, idempotencyKey);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 502 && err.type === "source_unreachable" && payload.source_url) {
+      const reason = err.details && err.details.reason ? err.details.reason : "unknown";
+      const useFallback = await shouldUseLocalFetch({ autoLocalFetch, reason, message: err.message });
+      if (!useFallback) {
+        fail(describeApiError(err));
+      }
+      writeErr(fmt.dim(`Fetching ${payload.source_url} locally...`));
+      let html;
+      try {
+        html = await localFetch(payload.source_url);
+      } catch (localErr) {
+        fail(`source_unreachable + local fallback failed.\n  server: ${err.message} (reason: ${reason})\n  local:  ${localErr.message}`);
+      }
+      const retryPayload = { ...payload, body_html: html };
+      delete retryPayload.source_url;
+      payload = retryPayload;
+      created = await postArticle(payload, uuidv4()); // fresh key for the retry
+    } else {
+      fail(describeApiError(err));
+    }
+  }
+
+  const article = created.data;
+
+  if (json && noWait) return writeOut(JSON.stringify(article, null, 2));
+  if (noWait) {
+    writeErr(summarizeArticleFromCreate(article));
+    writeOut(String(article.id));
+    return;
+  }
+
+  let final;
+  try {
+    final = await pollUntilDone(article.id, { intervalMs: DEFAULT_POLL_INTERVAL_MS, timeoutMs: timeoutSec * 1000, json });
+  } catch (err) {
+    if (err.timeout && json) {
+      writeOut(JSON.stringify(err.lastSnapshot, null, 2));
+      process.exit(3);
+    }
+    fail(err.message, 3);
+  }
+
+  if (json) return writeOut(JSON.stringify(final, null, 2));
+
+  writeOut(summarizeArticleFromCreate(final));
+  if (final.status === "completed") {
+    const textCount = Array.isArray(final.text_assets) ? final.text_assets.length : 0;
+    const imageCount = Array.isArray(final.image_assets) ? final.image_assets.length : 0;
+    writeOut(fmt.dim(`  assets: ${textCount} text, ${imageCount} image`));
+    writeOut(fmt.dim(`  inspect: postcraftstudio assets:list ${final.id}`));
+  } else if (final.status === "failed") {
+    process.exit(4);
+  }
+}
+
+async function shouldUseLocalFetch({ autoLocalFetch, reason, message }) {
+  if (autoLocalFetch) return true;
+  if (process.stdin.isTTY) {
+    writeErr("");
+    writeErr(fmt.yellow(`The server couldn't reach the source URL (${reason}): ${message}`));
+    return await confirm("Fetch it locally and upload the HTML?", false);
+  }
+  writeErr(fmt.yellow(`Source unreachable (${reason}): ${message}`));
+  writeErr(fmt.dim(`Rerun with ${fmt.bold("--auto-local-fetch")} to retry from this machine.`));
+  return false;
+}
+
+async function cmdArticlesStatus(args) {
+  const id = args._[1];
+  if (!id) fail("articles:status requires an article id: postcraftstudio articles:status <id>");
+  const { data } = await apiCall("GET", `/api/v1/articles/${id}`);
+  if (flagBool(args, "json")) return writeOut(JSON.stringify(data, null, 2));
+  writeOut(summarizeArticleFromCreate(data));
+  writeOut(fmt.dim(`  updated: ${data.updated_at}`));
+}
+
+async function cmdArticlesGet(args) {
+  const id = args._[1];
+  if (!id) fail("articles:get requires an article id: postcraftstudio articles:get <id>");
+  const { data } = await apiCall("GET", `/api/v1/articles/${id}`);
+  writeOut(JSON.stringify(data, null, 2));
+}
+
+async function cmdArticlesList(args) {
+  const limit = flagInt(args, "limit");
+  const cursor = flagString(args, "cursor");
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  const path = `/api/v1/articles${params.toString() ? "?" + params : ""}`;
+  const { data } = await apiCall("GET", path);
+  if (flagBool(args, "json")) return writeOut(JSON.stringify(data, null, 2));
+
+  const articles = Array.isArray(data.articles) ? data.articles : [];
+  const rows = (limit ? articles.slice(0, limit) : articles).map((a) => ({
+    id: a.id,
+    status: statusBadge(a.status || ""),
+    title: truncate(a.title || "", 50),
+    theme: a.theme_slug || "",
+    created: a.created_at ? a.created_at.slice(0, 10) : "",
+  }));
+  printTable(rows, [
+    { key: "id", title: "ID" },
+    { key: "status", title: "Status" },
+    { key: "title", title: "Title" },
+    { key: "theme", title: "Theme" },
+    { key: "created", title: "Created" },
+  ]);
+  if (data.next_cursor) writeErr(fmt.dim(`next page: postcraftstudio articles:list --cursor ${data.next_cursor}`));
 }
 
 // ----------------------------------------------------------------------------
@@ -329,10 +696,24 @@ function printHelp() {
     `${fmt.bold("Commands:")}`,
     `  setup                          Configure an API key (interactive)`,
     `  config:show                    Print current config (key is masked)`,
-    `  articles:create                Create an article ${fmt.dim("(U16 — pending)")}`,
-    `  articles:status <id>           Print article status ${fmt.dim("(U16 — pending)")}`,
-    `  articles:get <id>              Print full article JSON ${fmt.dim("(U16 — pending)")}`,
-    `  articles:list                  List articles ${fmt.dim("(U16 — pending)")}`,
+    `  articles:create                Create an article and (by default) wait for completion`,
+    `    --body <md>                    Article body in Markdown`,
+    `    --file <path>                  Read body from a file`,
+    `    --source-url <url>             Server fetches the URL via Cloudflare`,
+    `    --body-html <html>             Inline HTML to convert to Markdown`,
+    `    --theme-slug <slug>            Theme override`,
+    `    --writing-style-id <id>        Writing style override`,
+    `    --article-purpose <text>       Purpose hint for the pipeline`,
+    `    --main-idea <text>             Main-idea hint`,
+    `    --title <text>                 Title override`,
+    `    --generate <all|text|images>   What to generate (default all)`,
+    `    --no-wait                      Return article id immediately, skip polling`,
+    `    --timeout <seconds>            Polling timeout (default ${DEFAULT_TIMEOUT_SECONDS})`,
+    `    --idempotency-key <uuid>       Reuse to dedup retries (default: fresh UUID)`,
+    `    --auto-local-fetch             On 502 source_unreachable, retry from this machine`,
+    `  articles:status <id>           Print article status + summary`,
+    `  articles:get <id>              Print full article JSON`,
+    `  articles:list [--cursor <id>]  Cursor-paginated article list`,
     `  themes:list                    List themes ${fmt.dim("(U17 — pending)")}`,
     `  writing-styles:list            List writing styles ${fmt.dim("(U17 — pending)")}`,
     `  assets:list <article_id>       List assets for an article ${fmt.dim("(U17 — pending)")}`,
@@ -346,6 +727,8 @@ function printHelp() {
     `${fmt.bold("Environment:")}`,
     `  POSTCRAFTSTUDIO_API_KEY        API key (overrides config files)`,
     `  POSTCRAFTSTUDIO_BASE_URL       Override API host (default ${DEFAULT_BASE_URL})`,
+    ``,
+    `${fmt.bold("Exit codes:")} 0 success · 1 runtime/network · 2 invalid input · 3 timeout · 4 article failed`,
     ``,
     `${fmt.bold("Docs:")} https://postcraftstudio.com/api/v1/docs`,
   ];
@@ -364,12 +747,8 @@ function notImplementedYet(unit, command) {
 async function main(argv) {
   const args = parseArgs(argv);
 
-  if (args.flags.version || args.flags.v || args._[0] === "version") {
-    return printVersion();
-  }
-  if (args.flags.help || args.flags.h || args._.length === 0 || args._[0] === "help") {
-    return printHelp();
-  }
+  if (args.flags.version || args.flags.v || args._[0] === "version") return printVersion();
+  if (args.flags.help || args.flags.h || args._.length === 0 || args._[0] === "help") return printHelp();
 
   const command = args._[0];
 
@@ -380,10 +759,13 @@ async function main(argv) {
       return cmdConfigShow();
 
     case "articles:create":
+      return cmdArticlesCreate(args);
     case "articles:status":
+      return cmdArticlesStatus(args);
     case "articles:get":
+      return cmdArticlesGet(args);
     case "articles:list":
-      return notImplementedYet("U16", command);
+      return cmdArticlesList(args);
 
     case "themes:list":
     case "writing-styles:list":
@@ -400,7 +782,7 @@ async function main(argv) {
 
 main(process.argv.slice(2)).catch((err) => {
   if (err instanceof ApiError) {
-    fail(err.message);
+    fail(describeApiError(err));
   } else {
     writeErr(fmt.red("error: ") + (err && err.stack ? err.stack : String(err)));
     process.exit(1);
