@@ -1,8 +1,24 @@
 # Postcraftstudio Skill
 
-CLI for the [Postcraftstudio API](https://postcraftstudio.com/api/v1/docs).
-Drives article generation, asset retrieval, and discovery from a Claude skill
-or any shell. Zero runtime dependencies.
+Turn a Markdown article (or a URL) into ready-to-publish social posts and
+cover images, from your terminal or from Claude Code.
+
+[Postcraftstudio](https://postcraftstudio.com) is a service that takes one
+piece of long-form writing and generates the assets you need to promote it:
+LinkedIn posts, Twitter/X threads, cover images, and more. This repo is the
+official CLI — and a Claude Code skill wrapped around it — so you can drive
+the whole pipeline without leaving your editor.
+
+A typical session:
+
+```bash
+postcraftstudio articles:create --file ./my-post.md   # → article #42
+postcraftstudio assets:list 42                        # see what was generated
+postcraftstudio assets:download text 137 --out linkedin.md
+postcraftstudio assets:download image 88  --out cover.png
+```
+
+Zero runtime dependencies — a single Node.js script, runs unchanged on Bun.
 
 ## Requirements
 
@@ -12,10 +28,10 @@ or any shell. Zero runtime dependencies.
 
 Generate or rotate keys at <https://postcraftstudio.com/settings/api_keys>.
 
-## Install
+## Install (CLI)
 
 ```bash
-git clone https://github.com/<owner>/postcraftstudio-skill.git
+git clone https://github.com/lucianghinda/postcraftstudio-skill.git
 cd postcraftstudio-skill
 node scripts/postcraftstudio.js --version
 ```
@@ -27,9 +43,19 @@ ln -s "$(pwd)/scripts/postcraftstudio.js" /usr/local/bin/postcraftstudio
 postcraftstudio --version
 ```
 
-For Claude Code, copy or symlink the entire directory under
-`~/.claude/skills/postcraftstudio/` and Claude will discover the SKILL.md
-automatically.
+## Use with Claude Code
+
+The repo is also a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills).
+Symlink the whole directory under `~/.claude/skills/`:
+
+```bash
+ln -s "$(pwd)" ~/.claude/skills/postcraftstudio
+```
+
+Claude will pick up [SKILL.md](./SKILL.md) automatically and use it whenever
+you ask things like "generate posts from this article" or "download the
+LinkedIn asset for article 42." See SKILL.md for the agent-oriented
+reference (workflows, source-URL fallback, automation guidelines).
 
 ## Quick start
 

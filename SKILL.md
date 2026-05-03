@@ -20,7 +20,7 @@ resulting text and image assets via the [Postcraftstudio API](https://postcrafts
 
 ## Keeping this skill updated
 
-- **Source:** <https://github.com/<owner>/postcraftstudio-skill>
+- **Source:** <https://github.com/lucianghinda/postcraftstudio-skill>
 - **API docs:** <https://postcraftstudio.com/api/v1/docs>
 
 API and skill ship independently. Pull the latest from the source repo when
@@ -261,6 +261,75 @@ ID=$(./scripts/postcraftstudio.js articles:create --file ./post.md --no-wait)
 
 ```bash
 ./scripts/postcraftstudio.js articles:get 42 --json | jq '.text_assets[] | {id, asset_type, status}'
+```
+
+## Response shapes
+
+Use these field paths when piping `--json` output to `jq` or extracting
+values in scripts. Only the fields the CLI itself reads or displays are
+documented here; the API may return more.
+
+### Article (`articles:get`, `articles:status`, polled result of `articles:create`)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | integer | Article number — what every other CLI command takes |
+| `status` | string | `pending`, `processing`, `completed`, `failed` (terminal: last two) |
+| `title` | string | Server-resolved title (from `--title` or auto-derived) |
+| `theme_slug` | string | Resolved theme (see `themes:list`) |
+| `article_purpose` | string | Echo of `--article-purpose` if set |
+| `text_assets` | array | Present on `articles:get`; same shape as `assets:list` text rows |
+| `image_assets` | array | Present on `articles:get`; same shape as `assets:list` image rows |
+| `pipeline_runs` | array | Per-stage state — inspect on `failed` for diagnosis |
+| `updated_at` | timestamp | ISO 8601 |
+
+### Articles list (`articles:list`)
+
+Returns `{ articles: [...], next_cursor: <id|null> }`. Each item has the
+article fields above (minus `text_assets` / `image_assets` / `pipeline_runs`).
+Pass `--cursor <next_cursor>` to page.
+
+### Assets (`assets:list <article_id>`)
+
+Top-level shape: `{ text_assets: [...], image_assets: [...] }`.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | integer | Pass to `assets:download <text\|image> <id>` |
+| `asset_type` | string | E.g. `linkedin_post`, `twitter_thread`, `cover_image` |
+| `status` | string | Same lifecycle as articles |
+| `attached` | boolean | **Image assets only** — whether attached to the article |
+| `updated_at` | timestamp | ISO 8601 |
+
+### Themes (`themes:list`)
+
+`{ themes: [{ slug, name }] }`. Use `slug` with `--theme-slug`.
+
+### Writing styles (`writing-styles:list`)
+
+`{ writing_styles: [{ id, name, status, active, summary }] }`. Use `id` with
+`--writing-style-id`.
+
+### Errors
+
+Errors print a human line to stderr and exit non-zero. The JSON body, when
+present, includes `message`, `type` (e.g. `source_unreachable`), and
+`request_id`. Include `request_id` when filing support tickets.
+
+### Quick jq recipes
+
+```bash
+# Just the asset IDs and types for an article
+./scripts/postcraftstudio.js assets:list 42 --json \
+  | jq '[.text_assets[], .image_assets[]] | map({id, asset_type, status})'
+
+# Pull the LinkedIn post asset id
+./scripts/postcraftstudio.js assets:list 42 --json \
+  | jq '.text_assets[] | select(.asset_type == "linkedin_post") | .id'
+
+# Why did an article fail?
+./scripts/postcraftstudio.js articles:get 42 --json \
+  | jq '{status, failed_runs: [.pipeline_runs[] | select(.state == "failed")]}'
 ```
 
 ## Tips and gotchas
