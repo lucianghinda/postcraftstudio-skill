@@ -13,7 +13,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<owner>/postcraftstudio-skill.git"
+    "url": "git+https://github.com/lucianghinda/postcraftstudio-skill.git"
   },
   "homepage": "https://postcraftstudio.com/api/v1/docs",
   "license": "MIT",
