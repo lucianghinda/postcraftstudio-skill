@@ -5,9 +5,12 @@ description: >
   Postcraftstudio API. ALWAYS use this skill when asked to generate, fetch,
   list, or download Postcraftstudio articles, themes, writing styles, or
   associated text/image assets.
-last-updated: 2026-05-02
+last-updated: 2026-05-18
 allowed-tools: Bash(./scripts/postcraftstudio.js:*)
 ---
+
+# Postcraftstudio Skill
+
 
 # Postcraftstudio Skill
 

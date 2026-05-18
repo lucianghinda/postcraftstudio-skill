@@ -37,3 +37,22 @@ jobs:
       - name: --help renders
         run: node scripts/postcraftstudio.js --help
         if: startsWith(matrix.runtime, 'node-')
+
+  build-plugins:
+    name: Plugin artifacts up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Rebuild plugin artifacts from shared/
+        run: npm run build:plugins
+      - name: Fail if generated files drift from shared sources
+        run: |
+          if ! git diff --exit-code; then
+            echo
+            echo "::error::Generated plugin files are out of sync with shared/."
+            echo "Run 'npm run build:plugins' locally and commit the result."
+            exit 1
+          fi

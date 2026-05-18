@@ -1,0 +1,9 @@
+{
+  "name": "postcraftstudio",
+  "version": "1.0.0",
+  "description": "Create articles and retrieve generated text/image assets via the Postcraftstudio API.",
+  "author": "Lucian Ghinda",
+  "homepage": "https://postcraftstudio.com",
+  "repository": "https://github.com/lucianghinda/postcraftstudio-skill",
+  "license": "MIT"
+}

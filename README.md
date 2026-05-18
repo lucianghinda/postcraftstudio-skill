@@ -43,10 +43,20 @@ ln -s "$(pwd)/scripts/postcraftstudio.js" /usr/local/bin/postcraftstudio
 postcraftstudio --version
 ```
 
-## Use with Claude Code
+## Use as an agent plugin
 
-The repo is also a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills).
-Symlink the whole directory under `~/.claude/skills/`:
+The repo ships as a plugin for three AI coding agents. Each one wraps the
+same Node CLI under `scripts/postcraftstudio.js` and the same agent
+instructions in [SKILL.md](./SKILL.md), so commands and behavior are
+consistent across all three. Six slash commands are available everywhere:
+`/postcraft-create`, `/postcraft-status`, `/postcraft-list`,
+`/postcraft-themes`, `/postcraft-assets`, `/postcraft-download`.
+
+### Claude Code
+
+The repo is a [Claude Code plugin](https://docs.claude.com/en/docs/claude-code/plugins)
+with a skill, slash commands, and a manifest at `.claude-plugin/plugin.json`.
+The simplest install is to symlink the whole directory as a skill:
 
 ```bash
 ln -s "$(pwd)" ~/.claude/skills/postcraftstudio
@@ -54,8 +64,28 @@ ln -s "$(pwd)" ~/.claude/skills/postcraftstudio
 
 Claude will pick up [SKILL.md](./SKILL.md) automatically and use it whenever
 you ask things like "generate posts from this article" or "download the
-LinkedIn asset for article 42." See SKILL.md for the agent-oriented
-reference (workflows, source-URL fallback, automation guidelines).
+LinkedIn asset for article 42."
+
+### Codex CLI
+
+```bash
+./codex/install.sh
+```
+
+This symlinks the six `postcraft-*` prompts into `~/.codex/prompts/` (so they
+show up as slash commands) and appends a pointer to the bundled `AGENTS.md`
+into `~/.codex/AGENTS.md`. Set `CODEX_HOME` to install elsewhere. Re-running
+is safe.
+
+### OpenCode
+
+```bash
+./opencode/install.sh
+```
+
+This symlinks the agent definition into `~/.config/opencode/agent/` and the
+six commands into `~/.config/opencode/command/`. Set `OPENCODE_CONFIG` to
+install into a different config root.
 
 ## Quick start
 
@@ -120,7 +150,27 @@ POSTCRAFTSTUDIO_BASE_URL=http://localhost:3000 \
   node scripts/postcraftstudio.js setup               # against a local Rails server
 ```
 
-CI runs the `--version` and `--help` smokes on Node 18, 20, 22, and Bun.
+CI runs the `--version` and `--help` smokes on Node 18, 20, 22, and Bun, and
+verifies that the plugin artifacts are up to date with `shared/`.
+
+### Editing agent instructions or slash commands
+
+`shared/` is the single source of truth. The files under `skills/`,
+`commands/`, `codex/`, `opencode/`, and the root `SKILL.md` are **generated
+artifacts** — do not edit them directly.
+
+```bash
+# 1. Edit one of:
+#      shared/INSTRUCTIONS.md      — agent guidance body
+#      shared/commands/*.md        — slash command sources
+#      shared/meta.json            — last-updated stamp, etc.
+# 2. Rebuild:
+npm run build:plugins
+# 3. Commit both shared/ and the regenerated artifacts together.
+```
+
+CI re-runs the build and fails if generated files drift from `shared/`, so
+forgetting step 2 is caught before merge.
 
 ## License
 
