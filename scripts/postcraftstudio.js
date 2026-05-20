@@ -18,12 +18,13 @@ const os = require("os");
 const readline = require("readline");
 const crypto = require("crypto");
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const DEFAULT_BASE_URL = "https://postcraftstudio.com";
 const SETTINGS_URL = "https://postcraftstudio.com/settings/api_keys";
 const API_KEY_PATTERN = /^pcs_live_[A-Za-z0-9]{32}$/;
 const TOKEN_PROBE_PATH = "/api/v1/themes";
 const TERMINAL_STATUSES = new Set(["completed", "failed"]);
+const URL_QUOTE_TERMINAL_STATUSES = new Set(["succeeded", "failed"]);
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const LOCAL_FETCH_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -332,7 +333,7 @@ function printTable(rows, columns) {
 }
 
 function statusBadge(status) {
-  if (status === "completed") return fmt.green(status);
+  if (status === "completed" || status === "succeeded") return fmt.green(status);
   if (status === "failed") return fmt.red(status);
   if (status === "processing" || status === "pending") return fmt.yellow(status);
   return status;
@@ -666,6 +667,129 @@ async function cmdArticlesList(args) {
 }
 
 // ----------------------------------------------------------------------------
+// URL quote extraction commands
+
+function summarizeUrlQuoteExtraction(extraction) {
+  const lines = [
+    `${fmt.bold("URL quote extraction")} #${extraction.id} ${fmt.dim("[" + statusBadge(extraction.status) + "]")}`,
+  ];
+  if (extraction.source_url) lines.push(`  source: ${extraction.source_url}`);
+  if (extraction.updated_at) lines.push(`  updated: ${extraction.updated_at}`);
+  return lines.join("\n");
+}
+
+async function cmdUrlQuoteExtractionsCreate(args) {
+  const sourceUrl = flagString(args, "url");
+  if (!sourceUrl) fail("url-quote-extractions:create requires --url=<url>.");
+
+  const idempotencyKey = flagString(args, "idempotency-key") || uuidv4();
+  const { data } = await apiCall("POST", "/api/v1/url_quote_extractions", {
+    body: { source_url: sourceUrl },
+    headers: { "Idempotency-Key": idempotencyKey },
+  });
+
+  if (flagBool(args, "json")) return writeOut(JSON.stringify(data, null, 2));
+
+  writeErr(summarizeUrlQuoteExtraction(data));
+  writeErr(fmt.dim(`next: postcraftstudio url-quote-extractions:get --id=${data.id}`));
+  writeOut(String(data.id));
+}
+
+async function pollUrlQuoteExtractionUntilDone(id, { intervalMs, timeoutMs, json }) {
+  const started = Date.now();
+  let lastStatus = null;
+  while (true) {
+    const { data, response } = await apiCall("GET", `/api/v1/url_quote_extractions/${id}`);
+    if (data.status !== lastStatus && !json) {
+      writeErr(fmt.dim(`status: ${statusBadge(data.status)}`));
+      lastStatus = data.status;
+    }
+    if (URL_QUOTE_TERMINAL_STATUSES.has(data.status)) return data;
+    if (Date.now() - started >= timeoutMs) {
+      const err = new Error(`Timed out after ${(timeoutMs / 1000).toFixed(0)}s while polling. URL quote extraction ${id} is still ${data.status}; rerun 'postcraftstudio url-quote-extractions:get --id=${id}' to keep checking.`);
+      err.timeout = true;
+      err.lastSnapshot = data;
+      throw err;
+    }
+    const retryHeader = response.headers.get("retry-after");
+    const wait = retryHeader ? Math.max(1000, Number(retryHeader) * 1000) : intervalMs;
+    await sleep(wait);
+  }
+}
+
+async function cmdUrlQuoteExtractionsGet(args) {
+  const id = flagString(args, "id") || args._[1];
+  if (!id) fail("url-quote-extractions:get requires --id=<id>.");
+
+  const json = flagBool(args, "json");
+  const noWait = flagBool(args, "no-wait");
+  const timeoutSec = flagInt(args, "timeout") ?? DEFAULT_TIMEOUT_SECONDS;
+
+  let extraction;
+  if (noWait) {
+    extraction = (await apiCall("GET", `/api/v1/url_quote_extractions/${id}`)).data;
+  } else {
+    try {
+      extraction = await pollUrlQuoteExtractionUntilDone(id, {
+        intervalMs: DEFAULT_POLL_INTERVAL_MS,
+        timeoutMs: timeoutSec * 1000,
+        json,
+      });
+    } catch (err) {
+      if (err.timeout && json) {
+        writeOut(JSON.stringify(err.lastSnapshot, null, 2));
+        process.exit(3);
+      }
+      fail(err.message, 3);
+    }
+  }
+
+  if (json) return writeOut(JSON.stringify(extraction, null, 2));
+
+  writeOut(summarizeUrlQuoteExtraction(extraction));
+  if (extraction.status === "succeeded") {
+    const quotes = Array.isArray(extraction.quotes) ? extraction.quotes : [];
+    if (quotes.length) {
+      writeOut("");
+      writeOut(fmt.bold("Quotes"));
+      quotes.forEach((quote, index) => writeOut(`${index + 1}. "${quote}"`));
+    }
+    if (extraction.summary_image_url) {
+      writeOut("");
+      writeOut(`summary image: ${extraction.summary_image_url}`);
+    }
+  } else if (extraction.status === "failed") {
+    if (extraction.error_message) writeErr(fmt.red(extraction.error_message));
+    process.exit(4);
+  }
+}
+
+async function cmdUrlQuoteExtractionsList(args) {
+  const limit = flagInt(args, "limit");
+  const cursor = flagString(args, "cursor");
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  const path = `/api/v1/url_quote_extractions${params.toString() ? "?" + params : ""}`;
+  const { data } = await apiCall("GET", path);
+  if (flagBool(args, "json")) return writeOut(JSON.stringify(data, null, 2));
+
+  const extractions = Array.isArray(data.url_quote_extractions) ? data.url_quote_extractions : [];
+  const rows = (limit ? extractions.slice(0, limit) : extractions).map((extraction) => ({
+    id: extraction.id,
+    status: statusBadge(extraction.status || ""),
+    source: truncate(extraction.source_url || "", 64),
+    created: extraction.created_at ? extraction.created_at.slice(0, 10) : "",
+  }));
+  printTable(rows, [
+    { key: "id", title: "ID" },
+    { key: "status", title: "Status" },
+    { key: "source", title: "Source URL" },
+    { key: "created", title: "Created" },
+  ]);
+  if (data.next_cursor) writeErr(fmt.dim(`next page: postcraftstudio url-quote-extractions:list --cursor ${data.next_cursor}`));
+}
+
+// ----------------------------------------------------------------------------
 // discovery + asset commands (U17)
 
 async function cmdThemesList(args) {
@@ -869,6 +993,15 @@ function printHelp() {
     `  articles:status <id>           Print article status + summary`,
     `  articles:get <id>              Print full article JSON`,
     `  articles:list [--cursor <id>]  Cursor-paginated article list`,
+    `  url-quote-extractions:create   Extract three core quotes from a URL`,
+    `    --url <url>                    Source article URL`,
+    `    --idempotency-key <uuid>       Reuse to dedup retries (default: fresh UUID)`,
+    `  url-quote-extractions:get       Poll one extraction until succeeded or failed`,
+    `    --id <id>                      Extraction id`,
+    `    --no-wait                      Fetch one snapshot without polling`,
+    `    --timeout <seconds>            Polling timeout (default ${DEFAULT_TIMEOUT_SECONDS})`,
+    `  url-quote-extractions:list      Cursor-paginated extraction list`,
+    `    --cursor <id>                  Continue from a previous next_cursor`,
     `  themes:list                    List themes`,
     `  writing-styles:list            List writing styles`,
     `  assets:list <article_id>       List text and image assets for an article`,
@@ -916,6 +1049,13 @@ async function main(argv) {
       return cmdArticlesGet(args);
     case "articles:list":
       return cmdArticlesList(args);
+
+    case "url-quote-extractions:create":
+      return cmdUrlQuoteExtractionsCreate(args);
+    case "url-quote-extractions:get":
+      return cmdUrlQuoteExtractionsGet(args);
+    case "url-quote-extractions:list":
+      return cmdUrlQuoteExtractionsList(args);
 
     case "themes:list":
       return cmdThemesList(args);

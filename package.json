@@ -1,6 +1,6 @@
 {
   "name": "postcraftstudio",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "CLI for the Postcraftstudio API. Drives article generation, asset retrieval, and discovery from a Claude skill or any shell.",
   "bin": {
     "postcraftstudio": "./scripts/postcraftstudio.js"

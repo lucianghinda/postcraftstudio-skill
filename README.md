@@ -92,6 +92,7 @@ install into a different config root.
 ```bash
 postcraftstudio setup                                  # paste token + validate
 postcraftstudio articles:create --body "# Hello"       # create + wait for completion
+postcraftstudio url-quote-extractions:create --url https://example.com/post
 postcraftstudio articles:list                          # cursor-paginated table
 postcraftstudio assets:list 42                         # text + image assets for article 42
 postcraftstudio assets:download text 137 --out post.md
@@ -111,6 +112,9 @@ project-scoped storage.
 | `articles:status <id>`               | One-line status snapshot                       |
 | `articles:get <id>`                  | Full JSON                                      |
 | `articles:list [--cursor <id>]`      | Cursor-paginated list                          |
+| `url-quote-extractions:create --url` | Extract three core quotes from a URL           |
+| `url-quote-extractions:get --id`     | Poll and print quotes + summary image URL      |
+| `url-quote-extractions:list`         | Cursor-paginated extraction list               |
 | `themes:list`                        | Available theme slugs                          |
 | `writing-styles:list`                | Account writing styles                         |
 | `assets:list <article_id>`           | Text + image assets for an article             |

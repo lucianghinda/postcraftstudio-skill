@@ -71,6 +71,8 @@ Override the API host with `POSTCRAFTSTUDIO_BASE_URL` (default
 | "What's the status of article 42?"                    | `articles:status 42`                                                                  |
 | "Show me the full JSON for article 42"                | `articles:get 42`                                                                     |
 | "List my recent articles"                             | `articles:list`                                                                       |
+| "Extract the core quotes from this URL"                | `url-quote-extractions:create --url https://...`, then `url-quote-extractions:get --id <id>` |
+| "Show my recent URL quote extractions"                 | `url-quote-extractions:list`                                                         |
 | "Show available themes"                               | `themes:list`                                                                         |
 | "Show my writing styles"                              | `writing-styles:list`                                                                 |
 | "What assets did article 42 produce?"                 | `assets:list 42`                                                                      |
@@ -173,6 +175,19 @@ maximum of 5 redirects.
 | --------------------- | ---------------------------------------- |
 | `themes:list`         | Available theme slugs and display names  |
 | `writing-styles:list` | Account writing styles, newest first     |
+
+### URL Quote Extractions
+
+| Command                                      | Description                                      |
+| -------------------------------------------- | ------------------------------------------------ |
+| `url-quote-extractions:create --url=<url>`   | Submit a URL and print the new extraction id     |
+| `url-quote-extractions:get --id=<id>`        | Poll until terminal, then print quotes and image |
+| `url-quote-extractions:list [--cursor <id>]` | Cursor-paginated table of recent extractions     |
+
+`url-quote-extractions:get` honors `Retry-After` while polling. On success it
+prints the three verbatim quotes and `summary_image_url`; on failure it exits
+with code 4 and prints the API error message. Pass `--json` to any of the
+three commands to emit the raw API response.
 
 ### Assets
 

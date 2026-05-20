@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-05-19
+
+### Added
+
+- `url-quote-extractions:create --url=<url>` to submit a URL for core quote
+  extraction and print the new extraction id.
+- `url-quote-extractions:get --id=<id>` to poll until a URL quote extraction
+  reaches `succeeded` or `failed`, then print the quotes and summary image URL.
+- `url-quote-extractions:list` to page through recent authenticated-account
+  URL quote extractions.
+
 ## [1.0.0] — 2026-05-02
 
 ### Added
